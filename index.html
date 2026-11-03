@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neural Shading Lab</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500&display=swap" />
+  <style>
+    /* PP Mondwest is a Pangram Pangram font: used if installed, else a serif stands in. */
+    @font-face { font-family: Mondwest; src: local("PP Mondwest Bold"), local("PPMondwest-Bold"); font-weight: 700; }
+    :root { --bg: #050505; --tile: #0a0a0a; --green: #acff99; --dim: #bcbebc; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; height: 100dvh; overflow: hidden; display: grid; grid-template-columns: 1fr auto;
+      background: var(--bg); color: #fff; font: 500 14px/16px "IBM Plex Mono", ui-monospace, Consolas, monospace; letter-spacing: -0.05em;
+    }
+    main { position: relative; min-width: 0; min-height: 0; }
+    #main { position: absolute; inset: 0; width: 100%; height: 100%; cursor: grab; }
+    #main:active { cursor: grabbing; }
+    .hud { position: absolute; left: 14px; right: 14px; pointer-events: none; }
+    .hud > * { pointer-events: auto; }
+    .top { top: 11px; }
+    #status { margin: 0; font-size: 12px; line-height: 20px; color: var(--dim); }
+    .green { color: var(--green); }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px 20px; margin-top: 11px; }
+    .controls label { display: flex; gap: 8px; align-items: center; cursor: pointer; }
+    .controls input { appearance: none; width: 12px; height: 12px; margin: 0; border: 1px solid #fff; cursor: pointer; }
+    .controls input:checked { background: var(--green); border-color: var(--green); }
+    #reset { font: inherit; letter-spacing: inherit; color: var(--green); background: none; border: 0; padding: 0; text-decoration: underline; cursor: pointer; }
+    .bottom { bottom: 31px; left: 24px; right: 32px; display: flex; flex-wrap: wrap; gap: 16px; justify-content: space-between; align-items: flex-end; }
+    .score { max-width: 260px; font-size: 12px; text-align: right; }
+    .score p { margin: 13px 0 0; }
+    /* Too narrow for both side by side: the results wrap under the title, so align them with it. */
+    .bottom { container-type: inline-size; }
+    @container (max-width: 800px) { .score { text-align: left; margin-left: 3px; } }
+    h1 { margin: 0; font: 700 clamp(40px, 5vw, 72px)/1.08 Mondwest, Georgia, serif; letter-spacing: -0.05em; color: var(--green); }
+    .intro p { margin: 5px 0 0 3px; max-width: 450px; font-size: 16px; line-height: 18px; }
+
+    /* The textures: 2 wide, 6 squares tall, as high as the window. */
+    aside { height: 100dvh; aspect-ratio: 1 / 3; display: grid; grid: repeat(6, 1fr) / repeat(2, 1fr); grid-auto-flow: dense; background: var(--tile); }
+    figure { position: relative; margin: 0; min-width: 0; min-height: 0; aspect-ratio: 1; }
+    figure canvas { display: block; width: 100%; height: 100%; }
+    figure.big { grid-column: span 2; grid-row: span 2; }
+    figure[data-input] { cursor: pointer; }
+    figure.off canvas { opacity: .15; }
+    figcaption { position: absolute; inset: auto 6px 6px; padding: 4px 8px; background: #000c; font-size: 12px; opacity: 0; transition: opacity .15s; pointer-events: none; }
+    figcaption b { color: var(--green); font-weight: 500; }
+    figure:hover figcaption { opacity: 1; }
+
+    /* Portrait: the textures become a strip under the render, 6 wide and 2 tall. */
+    @media (max-aspect-ratio: 4/3) {
+      body { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
+      aside { height: auto; aspect-ratio: auto; grid: auto auto / repeat(6, 1fr); }
+      figure.big { grid-column: 5 / span 2; grid-row: 1 / span 2; }
+      .bottom { bottom: 16px; left: 14px; right: 14px; }
+      .intro p { font-size: 13px; line-height: 16px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <canvas id="main"></canvas>
+    <div class="hud top">
+      <p id="status"><span id="res">Neural render</span> · <span id="fps" class="green"></span> · <span id="stats">starting…</span> · <span id="shape"></span> · WebGPU · 512×512</p>
+      <div class="controls">
+        <label><input id="stop" type="checkbox" /> Stop training</label>
+        <label><input type="checkbox" data-input="4" /> Toggle position</label>
+        <label><input type="checkbox" data-input="2" /> Toggle View dir</label>
+        <label><input type="checkbox" data-input="5" /> Toggle Specular</label>
+        <button id="reset">Reset Network</button>
+      </div>
+    </div>
+    <div class="hud bottom">
+      <div class="intro">
+        <h1>Neural Rendering</h1>
+      </div>
+      <div class="score">
+        <p>Cycles <span id="cycles-cost">…</span></p>
+        <p><span class="green">Classic real-time</span> <span id="classic-cost">…</span><br />PSNR <span id="classic-psnr">…</span></p>
+        <p><span class="green">Neural</span> <span id="neural-cost">…</span><br />PSNR <span id="neural-psnr">…</span></p>
+      </div>
+    </div>
+  </main>
+
+  <aside>
+    <figure><canvas data-view="target"></canvas><figcaption><b>Target</b> · <span id="target">Cycles</span>, random-walk subsurface</figcaption></figure>
+    <figure><canvas data-view="classic"></canvas><figcaption><b>Classic real-time jade</b> · wrap diffuse, baked translucency, GGX</figcaption></figure>
+    <figure><canvas data-view="errNeural"></canvas><figcaption><b>Error</b> · |neural − Cycles| ×4</figcaption></figure>
+    <figure><canvas data-view="errClassic"></canvas><figcaption><b>Error</b> · |classic − Cycles| ×4</figcaption></figure>
+    <figure data-input="0"><canvas data-view="albedo"></canvas><figcaption><b>Albedo</b> · vertex colour · click to disable</figcaption></figure>
+    <figure data-input="1"><canvas data-view="normal"></canvas><figcaption><b>Normal</b> · world space · click to disable</figcaption></figure>
+    <figure data-input="3"><canvas data-view="thickness"></canvas><figcaption><b>Thickness</b> · baked · click to disable</figcaption></figure>
+    <figure data-input="3"><canvas data-view="light"></canvas><figcaption><b>AO + sun shadows</b> · baked · click to disable</figcaption></figure>
+    <figure class="big"><canvas data-view="features"></canvas><figcaption><b>Neural network</b> · first hidden layer, <span id="inputs"></span></figcaption></figure>
+  </aside>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
