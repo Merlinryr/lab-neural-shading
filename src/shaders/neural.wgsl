@@ -37,6 +37,7 @@ struct Frame {
   jadeB: vec4f,     //   absorption, shadow softness, ambient, specular (shared by both shaders)
   scoreClassic: u32, // score: 1 = the classic shader, 0 = the network
   specMask: f32,    // display only: add the analytic specular (1) or show the subsurface alone (0)
+  gridMask: vec2f,  // inference only: the neural texture's coarse / fine levels on (1) or off (0)
 }
 
 @group(0) @binding(0) var gAlbedo: texture_2d<f32>;
@@ -56,6 +57,10 @@ struct Frame {
 @group(0) @binding(14) var outClassic: texture_storage_2d<rgba16float, write>;
 // The neural texture's gradients. WGSL has no float atomics, so samples add fixed-point ints (x FIX).
 @group(0) @binding(15) var<storage, read_write> gridGrad: array<atomic<i32>>; // GRID_P
+// The other copy of the parameters: the EMA when training (adam writes it), the raw ones when
+// displaying. infer and score read `params`, which is the EMA in that bind group: no flicker.
+@group(0) @binding(16) var<storage, read_write> ema: array<f32>;  // P + GRID_P
+@group(0) @binding(17) var outGrid: texture_storage_2d<rgba16float, write>; // neural texture tiles: coarse .rg, fine .ba
 
 // ---------------------------------------------------------------- G-buffer
 
@@ -365,7 +370,7 @@ fn adam(@builtin(global_invocation_id) id: vec3u) {
     for (var b = 0u; b < BATCH; b++) { g += grads[b * P + p]; }
   } else { // a texel: skip it if no sample touched it (instant-ngp), else read and clear its gradient
     let raw = atomicLoad(&gridGrad[p - P]);
-    if (raw == 0) { return; }
+    if (raw == 0) { emaUpdate(p); return; }
     atomicStore(&gridGrad[p - P], 0);
     g = f32(raw) / FIX;
     lr = LR_GRID;
@@ -380,6 +385,15 @@ fn adam(@builtin(global_invocation_id) id: vec3u) {
   let mHat = m / (1.0 - pow(0.9, t));
   let vHat = v / (1.0 - pow(0.999, t));
   params[p] -= lr * mHat / (sqrt(vHat) + 1e-8);
+  emaUpdate(p);
+}
+
+// Exponential moving average of the weights, ~100 steps wide (instant-ngp, NRC). The display reads
+// it: each Adam step chases one random view, and the average cancels that noise. The ramp keeps
+// it from lagging behind the random init in the first steps.
+fn emaUpdate(p: u32) {
+  let t = f32(frame.step);
+  ema[p] = mix(params[p], ema[p], min(0.99, (1.0 + t) / (10.0 + t)));
 }
 
 // The neural render: the same forward pass, on every pixel.
@@ -392,10 +406,23 @@ fn infer(@builtin(global_invocation_id) id: vec3u) {
   if (s.hit) {
     let spec = specular(s) * frame.specMask * SPEC_ON;
     setInputs(s, frame.mask, frame.posMask);
+    if (GRID) {
+      for (var j = 0u; j < GRID_L * GRID_F; j++) { x[9u + j] *= select(frame.gridMask.y, frame.gridMask.x, j < GRID_L * GRID_F / 2u); }
+    }
     forward();
     c = srgb(spec + vec3f(y[0], y[1], y[2]));
   }
   textureStore(outNeural, id.xy, vec4f(c, 1.0));
+
+  // Debug: the neural texture's features at this pixel, summed over the coarse and the fine levels.
+  var g = vec4f(0.0);
+  if (GRID && s.hit) {
+    for (var l = 0u; l < GRID_L; l++) {
+      let f = vec2f(x[9u + l * GRID_F], x[10u + l * GRID_F]);
+      if (l < GRID_L / 2u) { g.x += f.x; g.y += f.y; } else { g.z += f.x; g.w += f.y; }
+    }
+  }
+  textureStore(outGrid, id.xy, g);
 
   // Debug: every 4th pixel writes the first 16 hidden activations into a 4x4 mosaic.
   if (all(id.xy % 4u == vec2u(0u))) {

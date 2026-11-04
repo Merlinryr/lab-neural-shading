@@ -3,15 +3,14 @@ import neuralWGSL from './shaders/neural.wgsl?raw'
 import blitWGSL from './shaders/blit.wgsl?raw'
 import { lookAt, multiply, perspective } from './scene'
 
-// URL knobs for experiments: see "Benchmark" in CLAUDE.md.
 const query = new URLSearchParams(location.search)
 const POS_ON = query.get('pos') === '0' ? 0 : 1
-const SPEC_ON = query.get('spec') === '0' ? 0 : 1 // 0: the network predicts the specular too
+const SPEC_ON = query.get('spec') === '0' ? 0 : 1
 const BENCH = +(query.get('bench') ?? 0)
-const LOSS = ['linear', 'relative', 'display'].indexOf(query.get('loss') ?? 'relative') // see train() in neural.wgsl
+const LOSS = ['linear', 'relative', 'display'].indexOf(query.get('loss') ?? 'relative')
 
 // ---- Network shape: the single source of truth, injected into neural.wgsl ----
-const FREQS = 2                          // Fourier octaves for the normal and reflection vectors
+const FREQS = 2 // Fourier octaves for the normal and reflection vectors
 const GRID = query.get('enc') !== 'fourier'
 const GRID_L = 8, GRID_F = 2, GRID_T = 2 ** 17 // levels, features per texel, texels per level
 // Cells along the dragon's box, coarsest and finest level. Finer than 128 scores better on the
@@ -33,20 +32,21 @@ const SIZE = 512                         // the dataset's resolution: training, 
 // Never trained on: every score in the lab is on these 8 views. Two per orbit height, rotated per
 // height, so they cover 8 different angles to the sun.
 const HELD_OUT = (i: number) => ((i % 16) - 2 * Math.floor(i / 16) + 13) % 8 === 0
-
 const $ = <T extends HTMLElement>(sel: string) => document.querySelector<T>(sel)!
 
-// ---- Device ----
 const adapter = await navigator.gpu?.requestAdapter()
 if (!adapter) {
   $('#stats').textContent = 'WebGPU is not available in this browser.'
   throw new Error('no WebGPU')
 }
 const TIMESTAMPS = adapter.features.has('timestamp-query') // GPU timers for the scoreboard
-const device = await adapter.requestDevice({ requiredFeatures: TIMESTAMPS ? ['timestamp-query'] : [] })
+const device = await adapter.requestDevice({
+  requiredFeatures: TIMESTAMPS ? ['timestamp-query'] : [],
+  requiredLimits: { maxStorageTexturesPerShaderStage: 5 }, // the default is 4: target, classic, neural, features, grid
+})
 device.addEventListener('uncapturederror', e => console.error((e as GPUUncapturedErrorEvent).error.message))
 
-// ---- Blender dataset: mesh, lights and Cycles frames written by blender/jade_dragon.py ----
+// Blender dataset
 type Vec3 = [number, number, number]
 type View = { file: string, yaw: number, pitch: number, eye: Vec3, seconds: number }
 const data: {
@@ -57,7 +57,10 @@ const data: {
 } = await fetch('/jade/cameras.json').then(r => r.json())
 const load = (file: string) => fetch(`/jade/${file}`).then(r => r.arrayBuffer())
 
-// The Cycles frames, one array layer each. PNG values are display colours (sRGB), alpha 0 off the dragon.
+
+
+
+// Cycles render frames -> one array layer each
 const framesTex = device.createTexture({
   size: [SIZE, SIZE, data.frames.length],
   format: 'rgba8unorm',
@@ -74,12 +77,16 @@ const testSet = views.filter(HELD_OUT)
 const fitSet = trainSet.filter((_, i) => i % 7 === 0) // the classic shader's knobs are fitted on these
 const cyclesSeconds = data.frames.reduce((s, f) => s + f.seconds, 0) / data.frames.length
 
-// ---- Buffers ----
+
+
+
+// Buffers
 const buffer = (size: number, usage: number) => device.createBuffer({ size, usage })
 const STORAGE = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
 const params = buffer((P + GRID_P) * 4, STORAGE)
 const adamM = buffer((P + GRID_P) * 4, STORAGE)
 const adamV = buffer((P + GRID_P) * 4, STORAGE)
+const ema = buffer((P + GRID_P) * 4, STORAGE) // moving average of params: what infer and score read
 const gridGrad = buffer(Math.max(GRID_P, 1) * 4, STORAGE)
 const grads = buffer(Math.max(BATCH * P, 3 * SIZE * SIZE) * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC)
 const losses = buffer((BATCH + 1) * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC)
@@ -106,13 +113,17 @@ function resetNetwork() {
   }
   for (let i = P; i < P + GRID_P; i++) w[i] = (Math.random() * 2 - 1) * 1e-4 // texels: near zero, as instant-ngp
   device.queue.writeBuffer(params, 0, w)
+  device.queue.writeBuffer(ema, 0, w)
   device.queue.writeBuffer(adamM, 0, new Float32Array(P + GRID_P))
   device.queue.writeBuffer(adamV, 0, new Float32Array(P + GRID_P))
   step = 0
 }
 resetNetwork()
 
-// ---- Pipelines ----
+
+
+
+// Pipelines
 const cameraLayout = device.createBindGroupLayout({
   entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: {} }],
 })
@@ -151,6 +162,8 @@ const computeLayout = device.createBindGroupLayout({
     { binding: 12, visibility: C, texture: { viewDimension: '2d-array' as const } },
     { binding: 13, visibility: C, texture: {} },
     { binding: 15, visibility: C, buffer: { type: 'storage' as const } },
+    { binding: 16, visibility: C, buffer: { type: 'storage' as const } },
+    { binding: 17, visibility: C, storageTexture: { format: 'rgba16float' as const } },
   ],
 })
 const vec3 = (v: number[]) => `vec3f(${v.map(x => x.toFixed(6)).join(', ')})`
@@ -174,7 +187,10 @@ const adamPipe = computePipe('adam')
 const inferPipe = computePipe('infer')
 const scorePipe = computePipe('score')
 
-// ---- Render targets: a G-buffer and the shaders' outputs at one resolution ----
+
+
+
+// Render targets
 // `lab` is 512² (training, scoring, tiles); the main view makes its own at the canvas's size.
 function renderTargets(width: number, height: number) {
   const texture = (format: GPUTextureFormat, usage: number) => device.createTexture({ size: [width, height], format, usage })
@@ -186,22 +202,27 @@ function renderTargets(width: number, height: number) {
     gPos: texture('rgba16float', RT), gBaked: texture('rgba16float', RT),
     depth: texture('depth24plus', GPUTextureUsage.RENDER_ATTACHMENT),
     target: texture('rgba16float', ST), classic: texture('rgba16float', ST),
-    neural: texture('rgba16float', ST), features: texture('rgba16float', ST),
+    neural: texture('rgba16float', ST), features: texture('rgba16float', ST), grid: texture('rgba16float', ST),
   }
-  const bind = device.createBindGroup({
+  // Two bind groups, the parameter copies swapped: `trainBind` trains params and averages them into
+  // ema, `bind` (everything else) reads ema as `params`.
+  const group = (live: GPUBuffer, other: GPUBuffer) => device.createBindGroup({
     layout: computeLayout,
     entries: [t.gAlbedo.createView(), t.gNormal.createView(), t.gPos.createView(), { buffer: frameBuf },
-      { buffer: params }, { buffer: adamM }, { buffer: adamV }, { buffer: grads }, { buffer: losses },
+      { buffer: live }, { buffer: adamM }, { buffer: adamV }, { buffer: grads }, { buffer: losses },
       t.target.createView(), t.neural.createView(), t.features.createView(), framesTex.createView({ dimension: '2d-array' }),
-      t.gBaked.createView(), t.classic.createView(), { buffer: gridGrad }]
+      t.gBaked.createView(), t.classic.createView(), { buffer: gridGrad }, { buffer: other }, t.grid.createView()]
       .map((resource, binding) => ({ binding, resource })),
   })
-  return { ...t, bind, destroy: () => Object.values(t).forEach(x => x instanceof GPUTexture && x.destroy()) }
+  return { ...t, bind: group(ema, params), trainBind: group(params, ema), destroy: () => Object.values(t).forEach(x => x instanceof GPUTexture && x.destroy()) }
 }
 type Targets = ReturnType<typeof renderTargets>
 const lab = renderTargets(SIZE, SIZE)
 
-// ---- Panels: one canvas each, blitted with a MODE-specialised pipeline ----
+
+
+
+// Panels: one canvas each, blitted with a MODE-specialised pipeline
 const format = navigator.gpu.getPreferredCanvasFormat()
 const blitModule = device.createShaderModule({ code: blitWGSL })
 const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' })
@@ -224,6 +245,8 @@ const VIEWS: Record<string, [mode: number, a: GPUTexture, b?: GPUTexture]> = {
   thickness: [6, lab.gBaked],
   light: [7, lab.gBaked],
   features: [4, lab.features],
+  gridCoarse: [8, lab.grid, lab.gPos],
+  gridFine: [9, lab.grid, lab.gPos],
   target: [0, lab.target],
   classic: [0, lab.classic],
   neural: [0, lab.neural],
@@ -251,18 +274,26 @@ function blit(encoder: GPUCommandEncoder, canvas: HTMLCanvasElement, context: GP
   p.end()
 }
 
-// ---- UI ----
+
+
+
+// UI
 let yaw = 0, pitch = 0.25, zoom = 1, dragging = false, training = true
 // Input groups zeroed at inference: header boxes (checked = off) and the G-buffer tiles (click = off).
-const mask = [1, 1, 1, 1, POS_ON, 1] // albedo, normal, view, baked, position, specular
+const mask = [1, 1, 1, 1, POS_ON, 1, 1, 1] // albedo, normal, view, baked, position, specular, neural texture coarse / fine
 document.querySelectorAll<HTMLInputElement>('input[data-input]').forEach(box => {
   box.checked = !mask[+box.dataset.input!]
-  box.addEventListener('change', () => { mask[+box.dataset.input!] = box.checked ? 0 : 1 })
+  box.addEventListener('change', () => {
+    const i = +box.dataset.input!
+    mask[i] = box.checked ? 0 : 1
+    document.querySelectorAll(`figure[data-input="${i}"]`).forEach(t => t.classList.toggle('off', !mask[i]))
+  })
 })
 document.querySelectorAll<HTMLElement>('figure[data-input]').forEach(tile => tile.addEventListener('click', () => {
   const i = +tile.dataset.input!
   mask[i] = 1 - mask[i]
   document.querySelectorAll(`figure[data-input="${i}"]`).forEach(t => t.classList.toggle('off', !mask[i])) // thickness and AO share "baked"
+  document.querySelectorAll<HTMLInputElement>(`input[data-input="${i}"]`).forEach(b => { b.checked = !mask[i] })
 }))
 $<HTMLInputElement>('#stop').addEventListener('change', e => { training = !(e.target as HTMLInputElement).checked })
 $('#reset').addEventListener('click', resetNetwork)
@@ -273,7 +304,6 @@ addEventListener('pointermove', e => {
   yaw -= e.movementX * 0.01
   pitch = Math.min(1.4, Math.max(-1.4, pitch + e.movementY * 0.01))
 })
-$('#shape').textContent = `${IN} → ${HID} → ${HID} → ${OUT} · ${P} params · ${MACS} MAC/pixel`
   + (GRID ? ` · neural texture ${GRID_L} × ${GRID_T / 1024}k × ${GRID_F}` : '')
 $('#inputs').textContent = `${IN} numbers a pixel in`
 $('#cycles-cost').textContent = `${cyclesSeconds.toFixed(1)} s / frame (${data.samples} samples)`
@@ -294,7 +324,10 @@ function fullTargets() {
   return full
 }
 
-// ---- Frame ----
+
+
+
+// Frame
 const frameData = new ArrayBuffer(96) // matches struct Frame in neural.wgsl
 const frameF32 = new Float32Array(frameData)
 const frameU32 = new Uint32Array(frameData)
@@ -321,6 +354,7 @@ function writeFrame(targetFrame: number, scoreClassic = false) {
   frameF32.set(jade, 12)
   frameU32[20] = scoreClassic ? 1 : 0
   frameF32[21] = mask[5]
+  frameF32.set(mask.slice(6, 8), 22)
   device.queue.writeBuffer(frameBuf, 0, frameData)
 }
 
@@ -338,9 +372,9 @@ function encodeGBuffer(encoder: GPUCommandEncoder, t: Targets) {
 }
 
 // Each dispatch covers the whole target (8x8 workgroups) or is a 1D count of workgroups.
-function encodeCompute(encoder: GPUCommandEncoder, t: Targets, dispatches: (GPUComputePipeline | [GPUComputePipeline, number])[]) {
+function encodeCompute(encoder: GPUCommandEncoder, t: Targets, dispatches: (GPUComputePipeline | [GPUComputePipeline, number])[], bind = t.bind) {
   const pass = encoder.beginComputePass()
-  pass.setBindGroup(0, t.bind)
+  pass.setBindGroup(0, bind)
   for (const d of dispatches) {
     if (Array.isArray(d)) { pass.setPipeline(d[0]); pass.dispatchWorkgroups(d[1]) }
     else { pass.setPipeline(d); pass.dispatchWorkgroups(Math.ceil(t.width / 8), Math.ceil(t.height / 8)) }
@@ -359,7 +393,7 @@ function trainStep() {
   writeFrame(k)
   const encoder = device.createCommandEncoder()
   encodeGBuffer(encoder, lab)
-  encodeCompute(encoder, lab, [[trainPipe, Math.ceil(BATCH / 64)], [adamPipe, Math.ceil((P + GRID_P + 1) / 64)]])
+  encodeCompute(encoder, lab, [[trainPipe, Math.ceil(BATCH / 64)], [adamPipe, Math.ceil((P + GRID_P + 1) / 64)]], lab.trainBind)
   device.queue.submit([encoder.finish()])
 }
 
@@ -475,7 +509,7 @@ function frame(now: number) {
   }
 
   if (frameIndex++ % 10 === 0) {
-    $('#res').textContent = `Neural render · ${t.width}×${t.height}`
+    $('#res').textContent = `${t.width}×${t.height} px`
     $('#fps').textContent = `${fps.toFixed(0)} fps`
     $('#stats').textContent = `step ${step} · loss ${isNaN(loss) ? '—' : loss.toExponential(2)}`
     $('#target').textContent = `Cycles frame ${shown}${HELD_OUT(shown) ? ' · held out' : ''}`
@@ -483,7 +517,10 @@ function frame(now: number) {
   requestAnimationFrame(frame)
 }
 
-// ---- Start: (re)fit the classic shader if asked, time both shaders, then train (live) or benchmark ----
+
+
+
+// Start: (re)fit the classic shader if asked, time both shaders, then train (live) or benchmark
 if (FIT) {
   $('#stats').textContent = 'fitting the classic shader to the training frames…'
   await fitClassic()

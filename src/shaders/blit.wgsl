@@ -19,6 +19,9 @@ fn vs(@builtin(vertex_index) i: u32) -> VOut {
   return VOut(vec4f(p, 0.0, 1.0), vec2f(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5));
 }
 
+// Two neural texture features as a colour: 0 is grey, each feature pushes along its own hue.
+fn latent(f: vec2f) -> vec3f { return 0.5 + 0.5 * tanh(3.0 * (f.x * vec3f(1.0, 0.35, -0.6) + f.y * vec3f(-0.5, 0.8, 0.6))); }
+
 @fragment
 fn fs(in: VOut) -> @location(0) vec4f {
   let a = textureSampleLevel(texA, samp, in.uv, 0.0);
@@ -32,6 +35,10 @@ fn fs(in: VOut) -> @location(0) vec4f {
     }
     case 6u: { c = vec3f(0.3, 1.0, 0.55) * (1.0 - exp(-4.0 * a.r)); }           // baked thickness
     case 7u: { c = a.y * vec3f(0.35) + a.z * vec3f(0.4, 0.38, 0.3) + a.w * vec3f(0.3, 0.27, 0.2); } // AO + sun visibility
+    case 8u, 9u: {                                                               // neural texture, texB = gPos for coverage
+      let hit = textureSampleLevel(texB, samp, in.uv, 0.0).w > 0.5;
+      c = select(vec3f(0.0), latent(select(a.zw, a.xy, MODE == 8u)), hit);
+    }
     default: {}
   }
   return vec4f(c, 1.0);

@@ -1,12 +1,9 @@
-// The camera maths. Nothing neural here. The model itself comes from blender/jade_dragon.py.
-
 type Vec3 = [number, number, number]
 const sub = (a: Vec3, b: Vec3): Vec3 => [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 const dot = (a: Vec3, b: Vec3) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 const cross = (a: Vec3, b: Vec3): Vec3 => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 const normalize = (a: Vec3): Vec3 => { const l = Math.hypot(...a); return [a[0] / l, a[1] / l, a[2] / l] }
 
-// Column-major 4x4 matrices, as WGSL's mat4x4f expects.
 export function perspective(fovY: number, aspect: number, near: number, far: number) {
   const f = 1 / Math.tan(fovY / 2)
   const nf = 1 / (near - far)
